@@ -12,7 +12,7 @@ readme = "README.md"
 license = "MIT"
 
 [dependencies]
-bdk = { version = "^0.7", default-features = false, features = ["all-keys"]}
+bdk = { git = "https://github.com/ulrichard/bdk", branch = "feature/proof_of_reserves", default-features = false, features = ["all-keys"]}
 bdk-macros = "^0.4"
 structopt = "^0.3"
 serde_json = { version = "^1.0" }
@@ -34,6 +34,7 @@ esplora = ["bdk/esplora"]
 compiler = ["bdk/compiler"]
 async-interface = ["bdk/async-interface"]
 compact_filters = ["bdk/compact_filters"]
+reserves = ["bdk/reserves"]
 
 [[bin]]
 name = "bdk-cli"

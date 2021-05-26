@@ -108,6 +108,7 @@ use structopt::StructOpt;
 
 use crate::OfflineWalletSubCommand::*;
 use crate::OnlineWalletSubCommand::*;
+use bdk::bitcoin::blockdata::transaction::TxOut;
 use bdk::bitcoin::consensus::encode::{deserialize, serialize, serialize_hex};
 use bdk::bitcoin::hashes::hex::FromHex;
 use bdk::bitcoin::secp256k1::Secp256k1;
@@ -119,6 +120,8 @@ use bdk::database::BatchDatabase;
 use bdk::descriptor::Segwitv0;
 #[cfg(feature = "compiler")]
 use bdk::descriptor::{Descriptor, Legacy, Miniscript};
+#[cfg(feature = "reserves")]
+use bdk::electrum_client::{Client, ElectrumApi};
 use bdk::keys::bip39::{Language, Mnemonic, MnemonicType};
 use bdk::keys::DescriptorKey::Secret;
 use bdk::keys::KeyError::{InvalidNetwork, Message};
@@ -126,6 +129,8 @@ use bdk::keys::{DerivableKey, DescriptorKey, ExtendedKey, GeneratableKey, Genera
 use bdk::miniscript::miniscript;
 #[cfg(feature = "compiler")]
 use bdk::miniscript::policy::Concrete;
+#[cfg(feature = "reserves")]
+use bdk::wallet::reserves::{verify_proof, ProofOfReserves};
 use bdk::wallet::AddressIndex;
 use bdk::Error;
 use bdk::SignOptions;
@@ -258,6 +263,22 @@ pub enum CliSubCommand {
     Repl {
         #[structopt(flatten)]
         wallet_opts: WalletOpts,
+    },
+    /// Proof of reserves sub-commands
+    #[cfg(all(feature = "reserves", feature = "electrum"))]
+    #[structopt(long_about = "Proof of reserves verification")]
+    Reserves {
+        /// Sets the challenge message with which the proof was produced
+        #[structopt(name = "MESSAGE", required = true, index = 1)]
+        message: String,
+        /// Sets the addresses for which the proof was produced
+        #[structopt(name = "ADDRESSES", required = true, index = 2)]
+        addresses: Vec<String>,
+        /// Sets the proof in form of a PSBT to verify
+        #[structopt(name = "PSBT", required = true, index = 3)]
+        psbt: String,
+        #[structopt(flatten)]
+        electrum_opts: ElectrumOpts,
     },
 }
 
@@ -646,6 +667,23 @@ pub enum OnlineWalletSubCommand {
         )]
         tx: Option<String>,
     },
+    /// Produce a proof of reserves
+    #[cfg(feature = "reserves")]
+    ProduceProof {
+        /// Sets the message
+        #[structopt(name = "MESSAGE", long = "message")]
+        msg: Option<String>,
+    },
+    /// Verify a proof of reserves
+    #[cfg(feature = "reserves")]
+    VerifyProof {
+        /// Sets the PSBT to verify
+        #[structopt(name = "BASE64_PSBT", long = "psbt")]
+        psbt: Option<String>,
+        /// Sets the message to verify
+        #[structopt(name = "MESSAGE", long = "message")]
+        msg: Option<String>,
+    },
 }
 
 fn parse_recipient(s: &str) -> Result<(Script, u64), String> {
@@ -694,7 +732,7 @@ where
     D: BatchDatabase,
 {
     match offline_subcommand {
-        GetNewAddress => Ok(json!({"address": wallet.get_address(AddressIndex::New)?})),
+        GetNewAddress => Ok(json!({"address": *wallet.get_address(AddressIndex::New)?})),
         ListUnspent => Ok(serde_json::to_value(&wallet.list_unspent()?)?),
         ListTransactions => Ok(serde_json::to_value(&wallet.list_transactions(false)?)?),
         GetBalance => Ok(json!({"satoshi": wallet.get_balance()?})),
@@ -883,6 +921,47 @@ where
             let txid = maybe_await!(wallet.broadcast(tx))?;
             Ok(json!({ "txid": txid }))
         }
+        #[cfg(feature = "reserves")]
+        ProduceProof { msg } => {
+            let message = if let Some(msg) = msg {
+                msg
+            } else {
+                panic!("Missing `message` option")
+            };
+
+            let mut psbt = maybe_await!(wallet.create_proof(&message))?;
+
+            let _finalized = wallet.sign(
+                &mut psbt,
+                SignOptions {
+                    trust_witness_utxo: true,
+                    ..Default::default()
+                },
+            )?;
+
+            let psbt_ser = serialize(&psbt);
+            let psbt_b64 = base64::encode(&psbt_ser);
+
+            Ok(json!({ "psbt": psbt , "psbt_base64" : psbt_b64}))
+        }
+        #[cfg(feature = "reserves")]
+        VerifyProof { psbt, msg } => {
+            let psbt = if let Some(psbt) = psbt {
+                let psbt = base64::decode(&psbt).unwrap();
+                let psbt: PartiallySignedTransaction = deserialize(&psbt).unwrap();
+                psbt
+            } else {
+                panic!("Missing `psbt` option")
+            };
+            let message = if let Some(msg) = msg {
+                msg
+            } else {
+                panic!("Missing `message` option")
+            };
+
+            let spendable = maybe_await!(wallet.verify_proof(&psbt, &message))?;
+            Ok(json!({ "spendable": spendable }))
+        }
     }
 }
 
@@ -1028,6 +1107,70 @@ pub fn handle_compile_subcommand(
     Ok(json!({"descriptor": descriptor.to_string()}))
 }
 
+/// Proof of reserves verification sub-command
+///
+/// Proof of reserves options are described in [`CliSubCommand::Reserves`].
+#[cfg(all(feature = "reserves", feature = "electrum"))]
+pub fn handle_reserves_subcommand(
+    network: Network,
+    message: String,
+    addresses: Vec<String>,
+    psbt: String,
+    electrum_opts: ElectrumOpts,
+) -> Result<serde_json::Value, Error> {
+    let psbt = base64::decode(&psbt).unwrap();
+    let psbt: PartiallySignedTransaction = deserialize(&psbt).unwrap();
+    let client = Client::new(&electrum_opts.electrum).unwrap();
+
+    let outpoints_per_addr: Result<Vec<_>, _> = addresses
+        .iter()
+        .map(|address| {
+            let address = Address::from_str(&address).unwrap();
+            get_outpoints_for_address(address, &client)
+        })
+        .collect();
+    let outpoints_combined = outpoints_per_addr?
+        .iter()
+        .fold(Vec::new(), |mut outpoints, outs| {
+            outpoints.append(&mut outs.clone());
+            outpoints
+        });
+
+    let spendable = verify_proof(&psbt, &message, outpoints_combined, network).unwrap();
+
+    Ok(json!({ "spendable": spendable }))
+}
+
+#[cfg(all(feature = "reserves", feature = "electrum"))]
+pub fn get_outpoints_for_address(
+    address: Address,
+    client: &Client,
+) -> Result<Vec<(OutPoint, TxOut)>, Error> {
+    let unspents = client
+        .script_list_unspent(&address.script_pubkey())
+        .map_err(Error::Electrum)?;
+
+    unspents
+        .iter()
+        .map(|utxo| {
+            let tx = match client.transaction_get(&utxo.tx_hash) {
+                Ok(tx) => tx,
+                Err(e) => {
+                    return Err(e).map_err(Error::Electrum);
+                }
+            };
+
+            Ok((
+                OutPoint {
+                    txid: utxo.tx_hash,
+                    vout: utxo.tx_pos as u32,
+                },
+                tx.output[utxo.tx_pos].clone(),
+            ))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod test {
     use super::{CliOpts, WalletOpts};
@@ -1043,11 +1186,24 @@ mod test {
     use crate::OnlineWalletSubCommand::{Broadcast, Sync};
     #[cfg(any(feature = "compact_filters", feature = "electrum"))]
     use crate::ProxyOpts;
+    #[cfg(feature = "reserves")]
+    use crate::OnlineWalletSubCommand::{ProduceProof, VerifyProof};
     use crate::{handle_key_subcommand, CliSubCommand, KeySubCommand, WalletSubCommand};
+    #[cfg(feature = "reserves")]
+    use crate::{handle_online_wallet_subcommand, handle_reserves_subcommand};
 
+    #[cfg(feature = "reserves")]
+    use bdk::bitcoin::{consensus::Encodable, util::psbt::PartiallySignedTransaction};
     use bdk::bitcoin::{Address, Network, OutPoint};
     use bdk::miniscript::bitcoin::network::constants::Network::Testnet;
-    use std::str::FromStr;
+    #[cfg(feature = "reserves")]
+    use bdk::{
+        blockchain::{noop_progress, ElectrumBlockchain},
+        database::MemoryDatabase,
+        electrum_client::Client,
+        Wallet,
+    };
+    use std::str::{self, FromStr};
     use structopt::StructOpt;
 
     #[test]
@@ -1522,5 +1678,260 @@ mod test {
             &descriptor,
             &"sh(wsh(thresh(3,pk(Alice),s:pk(Bob),s:pk(Carol),sdv:older(2))))#l4qaawgv"
         );
+    }
+
+    #[cfg(feature = "reserves")]
+    #[test]
+    fn test_parse_produce_proof() {
+        let message = "Those coins belong to Satoshi Nakamoto";
+        let cli_args = vec![
+            "bdk-cli",
+            "--network",
+            "bitcoin",
+            "wallet",
+            "--descriptor",
+            "wpkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)",
+            "produce_proof",
+            "--message",
+            message.clone(),
+        ];
+
+        let cli_opts = CliOpts::from_iter(&cli_args);
+
+        let expected_cli_opts = CliOpts {
+            network: Network::Bitcoin,
+            subcommand: CliSubCommand::Wallet {
+                wallet_opts: WalletOpts {
+                    wallet: "main".to_string(),
+                    descriptor: "wpkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)"
+                        .to_string(),
+                    change_descriptor: None,
+                    #[cfg(feature = "electrum")]
+                    electrum_opts: ElectrumOpts {
+                        timeout: None,
+                        electrum: "ssl://electrum.blockstream.info:60002".to_string(),
+                    },
+                    #[cfg(feature = "esplora")]
+                    esplora_opts: EsploraOpts {
+                        esplora: None,
+                        esplora_concurrency: 4,
+                    },
+                    #[cfg(any(feature="compact_filters", feature="electrum"))]
+                    proxy_opts: ProxyOpts{
+                        proxy: None,
+                        proxy_auth: None,
+                        retries: 5,
+                    }
+                },
+                subcommand: WalletSubCommand::OnlineWalletSubCommand(ProduceProof {
+                    msg: Some(message.to_string()),
+                }),
+            },
+        };
+
+        assert_eq!(expected_cli_opts, cli_opts);
+    }
+
+    #[cfg(feature = "reserves")]
+    #[test]
+    fn test_parse_verify_proof() {
+        let psbt = r#"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"#;
+        let message = "Those coins belong to Satoshi Nakamoto";
+        let cli_args = vec![
+            "bdk-cli",
+            "--network",
+            "bitcoin",
+            "wallet",
+            "--descriptor",
+            "wpkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)",
+            "verify_proof",
+            "--psbt",
+            psbt.clone(),
+            "--message",
+            message.clone(),
+        ];
+
+        let cli_opts = CliOpts::from_iter(&cli_args);
+
+        let expected_cli_opts = CliOpts {
+            network: Network::Bitcoin,
+            subcommand: CliSubCommand::Wallet {
+                wallet_opts: WalletOpts {
+                    wallet: "main".to_string(),
+                    descriptor: "wpkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)"
+                        .to_string(),
+                    change_descriptor: None,
+                    #[cfg(feature = "electrum")]
+                    electrum_opts: ElectrumOpts {
+                        timeout: None,
+                        electrum: "ssl://electrum.blockstream.info:60002".to_string(),
+                    },
+                    #[cfg(feature = "esplora")]
+                    esplora_opts: EsploraOpts {
+                        esplora: None,
+                        esplora_concurrency: 4,
+                    },
+                    #[cfg(any(feature="compact_filters", feature="electrum"))]
+                    proxy_opts: ProxyOpts{
+                        proxy: None,
+                        proxy_auth: None,
+                        retries: 5,
+                    }
+                },
+                subcommand: WalletSubCommand::OnlineWalletSubCommand(VerifyProof {
+                    psbt: Some(psbt.to_string()),
+                    msg: Some(message.to_string()),
+                }),
+            },
+        };
+
+        assert_eq!(expected_cli_opts, cli_opts);
+    }
+
+    /// Encodes a partially signed transaction as base64 and returns the  bytes of the resulting string.
+    #[cfg(feature = "reserves")]
+    fn encode_tx(psbt: PartiallySignedTransaction) -> Vec<u8> {
+        let mut encoded = Vec::<u8>::new();
+        psbt.consensus_encode(&mut encoded).unwrap();
+        let tx = base64::encode(&encoded);
+
+        tx.as_bytes().to_vec()
+    }
+
+    #[cfg(feature = "reserves")]
+    #[test]
+    fn test_proof_of_reserves_wallet() {
+        let descriptor = "wpkh(cVpPVruEDdmutPzisEsYvtST1usBR3ntr8pXSyt6D2YYqXRyPcFW)".to_string();
+        let message = "Those coins belong to Satoshi Nakamoto";
+
+        let client = Client::new("ssl://electrum.blockstream.info:60002").unwrap();
+        let wallet = Wallet::new(
+            &descriptor,
+            None,
+            Network::Testnet,
+            MemoryDatabase::default(),
+            ElectrumBlockchain::from(client),
+        )
+        .unwrap();
+
+        wallet.sync(noop_progress(), None).unwrap();
+        let balance = wallet.get_balance().unwrap();
+
+        let addr = wallet.get_address(bdk::wallet::AddressIndex::New).unwrap();
+        assert_eq!(
+            "tb1qanjjv4cs20dgv32vncrxw702l8g4qtn2m9wn7d",
+            addr.to_string()
+        );
+
+        let cli_args = vec![
+            "bdk-cli",
+            "--network",
+            "bitcoin",
+            "wallet",
+            "--descriptor",
+            &descriptor,
+            "produce_proof",
+            "--message",
+            message.clone(),
+        ];
+        let cli_opts = CliOpts::from_iter(&cli_args);
+
+        let wallet_subcmd = match cli_opts.subcommand {
+            CliSubCommand::Wallet {
+                wallet_opts: _,
+                subcommand: WalletSubCommand::OnlineWalletSubCommand(online_subcommand),
+            } => online_subcommand,
+            _ => panic!("unexpected subcommand"),
+        };
+        let result = handle_online_wallet_subcommand(&wallet, wallet_subcmd).unwrap();
+        let psbt: PartiallySignedTransaction =
+            serde_json::from_str(&result.as_object().unwrap().get("psbt").unwrap().to_string())
+                .unwrap();
+        let psbt = encode_tx(psbt);
+        let psbt = str::from_utf8(&psbt).unwrap();
+        assert_eq!(format!("{}", psbt), "cHNidP8BAPkBAAAABdA7AuVMuwIrkAuXtKDqw3BruovK2PH7E90MzCbyaAMlAAAAAAD/////Udmq/rw0BCeOv0OMZKuJ+Y9QrtHGO6uBM0jweOUGSN8AAAAAAP////+Qqm9aQARyBcGXI1LVZescpWIIGcV6X4Ea+Z+ufb/+pAAAAAAA/////9fvsPMMqtCakZnPaY1F+m5f0sUjcpw5zBrcDnDet16oAQAAAAD//////QnsSsnXa166jWlISb3qTDsP2cPmJiUvvcDhqGoY0IMBAAAAAP////8BYS4ZAAAAAAAZdqkUn3/QltN+0sDj9/DPySS+70/862iIrAAAAAAAAQEKAAAAAAAAAAABUQEHAAABAR8QJwAAAAAAABYAFOzlJlcQU9qGRUyeBmd56vnRUC5qIgIDKwVYB4vsOGlKhJM9ZZMD4lddrn6RaFkRRUEVv9ZEh+NHMEQCIAdYxY0Okfb6EO5S8hMz4w8SUYYnjimdDhKP0YQSqqVVAiBP8jXxdW+GYTOIT5dBRFjNGfkDEEy5wfL0QpSGl/AdHwEBBwABCGsCRzBEAiAHWMWNDpH2+hDuUvITM+MPElGGJ44pnQ4Sj9GEEqqlVQIgT/I18XVvhmEziE+XQURYzRn5AxBMucHy9EKUhpfwHR8BIQMrBVgHi+w4aUqEkz1lkwPiV12ufpFoWRFFQRW/1kSH4wABAR9hvRYAAAAAABYAFOzlJlcQU9qGRUyeBmd56vnRUC5qIgIDKwVYB4vsOGlKhJM9ZZMD4lddrn6RaFkRRUEVv9ZEh+NIMEUCIQCzujGMi2U0ol8iwEkzHDUTYCc0OVoRs+xwd2keXPBsbQIgdS9aP6xVBG7bSwhQn1qZKBuynhI78/q4m0Gz5YU4wW4BAQcAAQhsAkgwRQIhALO6MYyLZTSiXyLASTMcNRNgJzQ5WhGz7HB3aR5c8GxtAiB1L1o/rFUEbttLCFCfWpkoG7KeEjvz+ribQbPlhTjBbgEhAysFWAeL7DhpSoSTPWWTA+JXXa5+kWhZEUVBFb/WRIfjAAEBH6CGAQAAAAAAFgAU7OUmVxBT2oZFTJ4GZ3nq+dFQLmoiAgMrBVgHi+w4aUqEkz1lkwPiV12ufpFoWRFFQRW/1kSH40cwRAIgS71blHVIUZ/RYtHLSScAdfLH48gTa/44bEPoUnml+D8CIGcsTcC/MbZ0Une6l5H9l8n6+C4bqlDoAkeiZvnkIsOWAQEHAAEIawJHMEQCIEu9W5R1SFGf0WLRy0knAHXyx+PIE2v+OGxD6FJ5pfg/AiBnLE3AvzG2dFJ3upeR/ZfJ+vguG6pQ6AJHomb55CLDlgEhAysFWAeL7DhpSoSTPWWTA+JXXa5+kWhZEUVBFb/WRIfjAAEBH1DDAAAAAAAAFgAU7OUmVxBT2oZFTJ4GZ3nq+dFQLmoiAgMrBVgHi+w4aUqEkz1lkwPiV12ufpFoWRFFQRW/1kSH40cwRAIgO3JeprYMqTRS+4hvRxqL6xo4G/ONFvIdlBeJYSmc2wkCIDa4L9dCa0pVWNytsMBCQG9W3/BnsOiZBunkmP2ym116AQEHAAEIawJHMEQCIDtyXqa2DKk0UvuIb0cai+saOBvzjRbyHZQXiWEpnNsJAiA2uC/XQmtKVVjcrbDAQkBvVt/wZ7DomQbp5Jj9sptdegEhAysFWAeL7DhpSoSTPWWTA+JXXa5+kWhZEUVBFb/WRIfjAAA=");
+
+        let psbt_b64 = &result
+            .as_object()
+            .unwrap()
+            .get("psbt_base64")
+            .unwrap()
+            .to_string();
+        assert_eq!(&format!("{}", psbt), psbt_b64.trim_matches('\"'));
+
+        let cli_args = vec![
+            "bdk-cli",
+            "--network",
+            "bitcoin",
+            "wallet",
+            "--descriptor",
+            &descriptor,
+            "verify_proof",
+            "--psbt",
+            psbt,
+            "--message",
+            message.clone(),
+        ];
+        let cli_opts = CliOpts::from_iter(&cli_args);
+
+        let wallet_subcmd = match cli_opts.subcommand {
+            CliSubCommand::Wallet {
+                wallet_opts: _,
+                subcommand: WalletSubCommand::OnlineWalletSubCommand(online_subcommand),
+            } => online_subcommand,
+            _ => panic!("unexpected subcommand"),
+        };
+        let result = handle_online_wallet_subcommand(&wallet, wallet_subcmd).unwrap();
+        let spendable = result
+            .as_object()
+            .unwrap()
+            .get("spendable")
+            .unwrap()
+            .as_u64()
+            .unwrap();
+        assert_eq!(spendable, balance);
+    }
+
+    #[cfg(all(feature = "reserves", feature = "electrum"))]
+    #[test]
+    fn test_proof_of_reserves_veryfy() {
+        let message = "Those coins belong to Satoshi Nakamoto";
+        let address = "tb1qanjjv4cs20dgv32vncrxw702l8g4qtn2m9wn7d";
+        let psbt = "cHNidP8BAPkBAAAABdA7AuVMuwIrkAuXtKDqw3BruovK2PH7E90MzCbyaAMlAAAAAAD/////Udmq/rw0BCeOv0OMZKuJ+Y9QrtHGO6uBM0jweOUGSN8AAAAAAP////+Qqm9aQARyBcGXI1LVZescpWIIGcV6X4Ea+Z+ufb/+pAAAAAAA/////9fvsPMMqtCakZnPaY1F+m5f0sUjcpw5zBrcDnDet16oAQAAAAD//////QnsSsnXa166jWlISb3qTDsP2cPmJiUvvcDhqGoY0IMBAAAAAP////8BYS4ZAAAAAAAZdqkUn3/QltN+0sDj9/DPySS+70/862iIrAAAAAAAAQEKAAAAAAAAAAABUQEHAAABAR8QJwAAAAAAABYAFOzlJlcQU9qGRUyeBmd56vnRUC5qIgIDKwVYB4vsOGlKhJM9ZZMD4lddrn6RaFkRRUEVv9ZEh+NHMEQCIAdYxY0Okfb6EO5S8hMz4w8SUYYnjimdDhKP0YQSqqVVAiBP8jXxdW+GYTOIT5dBRFjNGfkDEEy5wfL0QpSGl/AdHwEBBwABCGsCRzBEAiAHWMWNDpH2+hDuUvITM+MPElGGJ44pnQ4Sj9GEEqqlVQIgT/I18XVvhmEziE+XQURYzRn5AxBMucHy9EKUhpfwHR8BIQMrBVgHi+w4aUqEkz1lkwPiV12ufpFoWRFFQRW/1kSH4wABAR9hvRYAAAAAABYAFOzlJlcQU9qGRUyeBmd56vnRUC5qIgIDKwVYB4vsOGlKhJM9ZZMD4lddrn6RaFkRRUEVv9ZEh+NIMEUCIQCzujGMi2U0ol8iwEkzHDUTYCc0OVoRs+xwd2keXPBsbQIgdS9aP6xVBG7bSwhQn1qZKBuynhI78/q4m0Gz5YU4wW4BAQcAAQhsAkgwRQIhALO6MYyLZTSiXyLASTMcNRNgJzQ5WhGz7HB3aR5c8GxtAiB1L1o/rFUEbttLCFCfWpkoG7KeEjvz+ribQbPlhTjBbgEhAysFWAeL7DhpSoSTPWWTA+JXXa5+kWhZEUVBFb/WRIfjAAEBH6CGAQAAAAAAFgAU7OUmVxBT2oZFTJ4GZ3nq+dFQLmoiAgMrBVgHi+w4aUqEkz1lkwPiV12ufpFoWRFFQRW/1kSH40cwRAIgS71blHVIUZ/RYtHLSScAdfLH48gTa/44bEPoUnml+D8CIGcsTcC/MbZ0Une6l5H9l8n6+C4bqlDoAkeiZvnkIsOWAQEHAAEIawJHMEQCIEu9W5R1SFGf0WLRy0knAHXyx+PIE2v+OGxD6FJ5pfg/AiBnLE3AvzG2dFJ3upeR/ZfJ+vguG6pQ6AJHomb55CLDlgEhAysFWAeL7DhpSoSTPWWTA+JXXa5+kWhZEUVBFb/WRIfjAAEBH1DDAAAAAAAAFgAU7OUmVxBT2oZFTJ4GZ3nq+dFQLmoiAgMrBVgHi+w4aUqEkz1lkwPiV12ufpFoWRFFQRW/1kSH40cwRAIgO3JeprYMqTRS+4hvRxqL6xo4G/ONFvIdlBeJYSmc2wkCIDa4L9dCa0pVWNytsMBCQG9W3/BnsOiZBunkmP2ym116AQEHAAEIawJHMEQCIDtyXqa2DKk0UvuIb0cai+saOBvzjRbyHZQXiWEpnNsJAiA2uC/XQmtKVVjcrbDAQkBvVt/wZ7DomQbp5Jj9sptdegEhAysFWAeL7DhpSoSTPWWTA+JXXa5+kWhZEUVBFb/WRIfjAAA=";
+
+        let cli_args = vec![
+            "bdk-cli",
+            "--network",
+            "bitcoin",
+            "reserves",
+            message,
+            address,
+            address, // passing the address twice on purpose to test passing of multiple addresses
+            psbt,
+            "--server",
+            "ssl://electrum.blockstream.info:60002",
+        ];
+        let cli_opts = CliOpts::from_iter(&cli_args);
+
+        let (message, addresses, psbt, electrum_opts) = match cli_opts.subcommand {
+            CliSubCommand::Reserves {
+                message,
+                addresses,
+                psbt,
+                electrum_opts,
+            } => (message, addresses, psbt, electrum_opts),
+            _ => panic!("unexpected subcommand"),
+        };
+        let result =
+            handle_reserves_subcommand(Network::Testnet, message, addresses, psbt, electrum_opts)
+                .unwrap();
+        let spendable = result
+            .as_object()
+            .unwrap()
+            .get("spendable")
+            .unwrap()
+            .as_u64()
+            .unwrap();
+        assert!(spendable > 0);
     }
 }
