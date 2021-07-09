@@ -930,6 +930,7 @@ where
                 panic!("Missing `message` option")
             };
 
+            let wallet: &ProofOfReserves = wallet;
             let mut psbt = maybe_await!(wallet.create_proof(&message))?;
 
             let _finalized = wallet.sign(
