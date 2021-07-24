@@ -130,12 +130,12 @@ use bdk::keys::{DerivableKey, DescriptorKey, ExtendedKey, GeneratableKey, Genera
 use bdk::miniscript::miniscript;
 #[cfg(feature = "compiler")]
 use bdk::miniscript::policy::Concrete;
-#[cfg(feature = "reserves")]
-use bdk_reserves::reserves::{verify_proof, ProofOfReserves};
 use bdk::wallet::AddressIndex;
 use bdk::Error;
 use bdk::SignOptions;
 use bdk::{FeeRate, KeychainKind, Wallet};
+#[cfg(feature = "reserves")]
+use bdk_reserves::reserves::{verify_proof, ProofOfReserves};
 
 /// Global options
 ///
@@ -733,7 +733,7 @@ where
     D: BatchDatabase,
 {
     match offline_subcommand {
-        GetNewAddress => Ok(json!({"address": wallet.get_address(AddressIndex::New)?})),
+        GetNewAddress => Ok(json!({"address": wallet.get_address(AddressIndex::New)?.address})),
         ListUnspent => Ok(serde_json::to_value(&wallet.list_unspent()?)?),
         ListTransactions => Ok(serde_json::to_value(&wallet.list_transactions(false)?)?),
         GetBalance => Ok(json!({"satoshi": wallet.get_balance()?})),
@@ -930,7 +930,6 @@ where
                 panic!("Missing `message` option")
             };
 
-            let wallet: &ProofOfReserves = wallet;
             let mut psbt = maybe_await!(wallet.create_proof(&message))?;
 
             let _finalized = wallet.sign(
@@ -1186,10 +1185,10 @@ mod test {
     use crate::EsploraOpts;
     use crate::OfflineWalletSubCommand::{CreateTx, GetNewAddress};
     use crate::OnlineWalletSubCommand::{Broadcast, Sync};
-    #[cfg(any(feature = "compact_filters", feature = "electrum"))]
-    use crate::ProxyOpts;
     #[cfg(feature = "reserves")]
     use crate::OnlineWalletSubCommand::{ProduceProof, VerifyProof};
+    #[cfg(any(feature = "compact_filters", feature = "electrum"))]
+    use crate::ProxyOpts;
     use crate::{handle_key_subcommand, CliSubCommand, KeySubCommand, WalletSubCommand};
     #[cfg(feature = "reserves")]
     use crate::{handle_online_wallet_subcommand, handle_reserves_subcommand};
@@ -1718,12 +1717,12 @@ mod test {
                         esplora: None,
                         esplora_concurrency: 4,
                     },
-                    #[cfg(any(feature="compact_filters", feature="electrum"))]
-                    proxy_opts: ProxyOpts{
+                    #[cfg(any(feature = "compact_filters", feature = "electrum"))]
+                    proxy_opts: ProxyOpts {
                         proxy: None,
                         proxy_auth: None,
                         retries: 5,
-                    }
+                    },
                 },
                 subcommand: WalletSubCommand::OnlineWalletSubCommand(ProduceProof {
                     msg: Some(message.to_string()),
@@ -1773,12 +1772,12 @@ mod test {
                         esplora: None,
                         esplora_concurrency: 4,
                     },
-                    #[cfg(any(feature="compact_filters", feature="electrum"))]
-                    proxy_opts: ProxyOpts{
+                    #[cfg(any(feature = "compact_filters", feature = "electrum"))]
+                    proxy_opts: ProxyOpts {
                         proxy: None,
                         proxy_auth: None,
                         retries: 5,
-                    }
+                    },
                 },
                 subcommand: WalletSubCommand::OnlineWalletSubCommand(VerifyProof {
                     psbt: Some(psbt.to_string()),
