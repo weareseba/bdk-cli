@@ -57,8 +57,7 @@ use bdk::blockchain::{AnyBlockchain, AnyBlockchainConfig, ConfigurableBlockchain
 use bdk::blockchain::rpc::{wallet_name_from_descriptor, Auth, RpcConfig};
 
 use bdk::database::BatchDatabase;
-use bdk::sled;
-use bdk::sled::Tree;
+use bdk::database::MemoryDatabase;
 use bdk::Wallet;
 use bdk::{bitcoin, Error};
 use bdk_cli::WalletSubCommand;
@@ -116,15 +115,6 @@ fn prepare_home_dir() -> PathBuf {
     #[cfg(feature = "compact_filters")]
     dir.push("compact_filters");
     dir
-}
-
-fn open_database(wallet_opts: &WalletOpts) -> Tree {
-    let mut database_path = prepare_home_dir();
-    database_path.push(wallet_opts.wallet.clone());
-    let database = sled::open(database_path).unwrap();
-    let tree = database.open_tree(&wallet_opts.wallet).unwrap();
-    debug!("database opened successfully");
-    tree
 }
 
 #[cfg(any(
@@ -277,7 +267,7 @@ fn handle_command(cli_opts: CliOpts, network: Network) -> Result<String, Error> 
             wallet_opts,
             subcommand: WalletSubCommand::OnlineWalletSubCommand(online_subcommand),
         } => {
-            let database = open_database(&wallet_opts);
+            let database = MemoryDatabase::default();
             let wallet = new_online_wallet(network, &wallet_opts, database)?;
             let result = bdk_cli::handle_online_wallet_subcommand(&wallet, online_subcommand)?;
             serde_json::to_string_pretty(&result)?
@@ -286,7 +276,7 @@ fn handle_command(cli_opts: CliOpts, network: Network) -> Result<String, Error> 
             wallet_opts,
             subcommand: WalletSubCommand::OfflineWalletSubCommand(offline_subcommand),
         } => {
-            let database = open_database(&wallet_opts);
+            let database = MemoryDatabase::default();
             let wallet = new_offline_wallet(network, &wallet_opts, database)?;
             let result = bdk_cli::handle_offline_wallet_subcommand(
                 &wallet,
@@ -311,7 +301,7 @@ fn handle_command(cli_opts: CliOpts, network: Network) -> Result<String, Error> 
         }
         #[cfg(feature = "repl")]
         CliSubCommand::Repl { wallet_opts } => {
-            let database = open_database(&wallet_opts);
+            let database = MemoryDatabase::default();
 
             #[cfg(any(
                 feature = "electrum",
